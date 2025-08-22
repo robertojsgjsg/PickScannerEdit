@@ -501,6 +501,26 @@ async def send_update_result(bet_id: str, result: str) -> dict:
         r.raise_for_status()
         return r.json()
 
+async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Uso: /result <betId> <G|P|N>
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text("Uso: /result <betId> <G|P|N>\nEjemplo: /result TEST123 G")
+        return
+
+    bet_id = context.args[0].strip()
+    res = context.args[1].strip().upper()
+    if res not in {"G", "P", "N"}:
+        await update.message.reply_text("Resultado inválido. Usa G (Ganado), P (Perdido) o N (Nulo).")
+        return
+
+    try:
+        data = await send_update_result(bet_id, res)
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error", "Error en Web App"))
+        await update.message.reply_text(f"✅ Actualizado: betId={bet_id} → Resultado={res} (fila {data.get('row')})")
+    except Exception as e:
+        await update.message.reply_text(f"❌ No pude actualizar: {e}")
+
 async def cmd_result_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Permite: /<betId> <G|P|N>
@@ -514,31 +534,25 @@ async def cmd_result_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parts:
         return
 
-    # 1) Extrae el "comando" como candidato a betId
     cmd = parts[0]
     if not cmd.startswith("/"):
         return
-    # /algo@TuBot -> /algo
     if "@" in cmd:
         cmd = cmd.split("@", 1)[0]
-    bet_id = cmd[1:]  # sin la /
+    bet_id = cmd[1:]  # sin la barra inicial
 
-    # 2) Ignora comandos reales del bot
     known = {"start", "apuesta", "modificarcelda", "result", "cancel", "help"}
     if bet_id.lower() in known:
-        return  # que lo atienda su handler específico
+        return
 
-    # 3) Valida formato de betId (letras/números/_ y longitud razonable)
     if not re.fullmatch(r"[A-Za-z0-9_]{6,64}", bet_id):
-        return  # no parece betId, ignoramos
+        return
 
-    # 4) Lee el resultado si viene
     res = parts[1].strip().upper() if len(parts) >= 2 else ""
     if res not in {"G", "P", "N"}:
         await update.message.reply_text("Uso: /<betId> <G|P|N>\nEj: /B17559000842117a4e G")
         return
 
-    # 5) Llama al Web App
     try:
         data = await send_update_result(bet_id, res)
         if not data.get("ok"):
@@ -602,6 +616,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
