@@ -257,7 +257,15 @@ async def cmd_modificar_celda(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ No pude guardar la celda: {e}")
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
+
+    # 👉 Si ya tenemos equipos en el borrador y aún no hay selección,
+    # trata este mensaje como selección (incluye "Otro" o texto libre)
+    existing = context.user_data.get("draft")
+    if isinstance(existing, Draft) and existing.teams and not existing.selection:
+        return await ask_selection(update, context)
+
+    # Si es el primer mensaje del flujo, sembramos el borrador
     draft = smart_seed(text)
     context.user_data["draft"] = draft
 
@@ -483,6 +491,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
