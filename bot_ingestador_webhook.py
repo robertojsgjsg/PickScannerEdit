@@ -257,16 +257,42 @@ async def cmd_modificar_celda(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ No pude guardar la celda: {e}")
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
+    txt = (update.message.text or "").strip()
+    draft: Optional[Draft] = context.user_data.get("draft")
 
-    # 👉 Si ya tenemos equipos en el borrador y aún no hay selección,
-    # trata este mensaje como selección (incluye "Otro" o texto libre)
-    existing = context.user_data.get("draft")
-    if isinstance(existing, Draft) and existing.teams and not existing.selection:
-        return await ask_selection(update, context)
+    # Si ya hay un borrador, enruta según lo que falte
+    if isinstance(draft, Draft):
+        # 1) Si aún no hay equipos, intenta tomarlos de este mensaje
+        if not draft.teams:
+            if " vs " in txt or " VS " in txt.upper():
+                draft.teams = txt
+                context.user_data["draft"] = draft
+                await update.message.reply_text(
+                    "Selecciona la *apuesta real* que jugaste:",
+                    parse_mode="Markdown",
+                    reply_markup=SELEC_KB
+                )
+                return ASK_SELECTION
+            else:
+                await update.message.reply_text(
+                    "No pude reconocer los *equipos*.\nEscríbelos como `Equipo A vs Equipo B`:",
+                    parse_mode="Markdown",
+                )
+                return ASK_TEAMS
 
-    # Si es el primer mensaje del flujo, sembramos el borrador
-    draft = smart_seed(text)
+        # 2) Si faltaba selección, trata este texto como selección (incluye “Otro” y libre)
+        if not draft.selection:
+            return await ask_selection(update, context)
+
+        # 3) Si falta la cuota, trata este texto como cuota
+        if not draft.odds or draft.odds < 1.01:
+            return await ask_odds(update, context)
+
+        # 4) Si ya hay cuota, trata este texto como stake (número o botones)
+        return await stake_text(update, context)
+
+    # Si NO hay borrador aún: sembrar desde el mensaje pegado
+    draft = smart_seed(txt)
     context.user_data["draft"] = draft
 
     if not draft.teams:
@@ -491,6 +517,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
