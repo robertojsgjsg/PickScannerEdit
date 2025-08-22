@@ -359,12 +359,14 @@ async def ask_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_ODDS
 
     context.user_data["draft"] = draft
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Usar 1€", callback_data="stake_default"),
-         InlineKeyboardButton("Cambiar importe", callback_data="stake_change")]
-    ])
-    await update.message.reply_text("¿Stake?", reply_markup=kb)
-    return ASK_STAKE
+    # (ANTES había InlineKeyboardMarkup; reemplázalo por ReplyKeyboardMarkup)
+kb = ReplyKeyboardMarkup(
+    [["Usar 1€", "Cambiar importe"]],
+    resize_keyboard=True,
+    one_time_keyboard=True
+)
+await update.message.reply_text("¿Stake?", reply_markup=kb)
+return ASK_STAKE
 
 async def ask_stake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -517,6 +519,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
