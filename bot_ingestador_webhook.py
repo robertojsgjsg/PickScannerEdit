@@ -1,4 +1,3 @@
-# bot_ingestador_webhook.py
 import os
 import re
 import json
@@ -77,7 +76,7 @@ def now_tz():
             return datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
         pass
-    return datetime.now()  # fallback
+    return datetime.now()
 
 def today_str() -> str:
     return now_tz().strftime(DATE_OUT_FMT)
@@ -113,7 +112,7 @@ def smart_seed(text: str) -> Draft:
     d = Draft(raw=text)
     d.date = _parse_date_ddmmyyyy(text) or today_str()
     d.teams = _parse_teams(text) or ""
-    return d  # NO autodetectar cuota por tu decisión
+    return d  # No autodetectar cuota (siempre preguntar)
 
 # ---------- Upstash (REST) ----------
 async def upstash_cmd(command):
@@ -163,7 +162,7 @@ async def send_to_sheets(draft: Draft) -> dict:
         "odds": draft.odds,
         "stake": draft.stake,
         "result": draft.result,
-        "betId": draft.betId,  # col. I
+        "betId": draft.betId,
     }
     async with httpx.AsyncClient(timeout=12) as client:
         r = await client.post(SHEETS_WEBAPP_URL, json=payload)
@@ -190,7 +189,6 @@ def summary_text(d: Draft) -> str:
     )
 
 def gen_bet_id() -> str:
-    # ID corto estable basado en tiempo + random hash of now
     ts = int(datetime.now(timezone.utc).timestamp() * 1000)
     tail = hashlib.sha1(str(ts).encode()).hexdigest()[:4]
     return f"B{ts}{tail}"
@@ -200,7 +198,7 @@ def valid_cell_a1(s: str) -> bool:
 
 def is_allowed_user(user_id: int) -> bool:
     if not APUESTA_ALLOWED_USER_IDS:
-        return True  # si no se configuró, es público
+        return True
     return user_id in APUESTA_ALLOWED_USER_IDS
 
 # ---------- Handlers ----------
@@ -221,7 +219,6 @@ async def cmd_apuesta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No autorizado para /apuesta.")
         return
 
-    # lee celda personalizada desde Upstash si existe
     cell_key = f"{MEMORY_NAMESPACE}:apuesta_cell:{uid}"
     cell = APUESTA_DEFAULT_CELL
     try:
@@ -400,7 +397,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = await send_to_sheets(draft)
             if not res.get("ok"):
                 raise RuntimeError(res.get("error", "Sheets WebApp error"))
-            # Marcar dedupe + guardar snapshot (incluye betId)
+            # Marcar dedupe + snapshot
             if DEDUPE_ENABLED:
                 try:
                     await upstash_setex(draft.dedupe_key(), MEMORY_TTL_DAYS, json.dumps(asdict(draft)))
@@ -456,7 +453,7 @@ def main():
 
     application.add_handler(conv)
 
-    # Webhook simple
+    # Webhook
     url_path = TOKEN  # seguridad básica
     webhook_url = f"{WEBHOOK_BASE_URL}/{url_path}"
 
