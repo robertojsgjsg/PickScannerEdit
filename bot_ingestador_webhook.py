@@ -171,8 +171,8 @@ async def send_to_sheets(draft: Draft) -> dict:
 
 async def read_cell_from_sheets(cell: str) -> dict:
     url = f"{SHEETS_WEBAPP_URL}?action=readCell&cell={cell}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url)
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        r = await client.get(url, follow_redirects=True)
         r.raise_for_status()
         return r.json()
 
@@ -466,3 +466,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
