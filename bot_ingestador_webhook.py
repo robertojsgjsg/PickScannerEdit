@@ -352,22 +352,30 @@ async def ask_stake(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_STAKE
 
 async def stake_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_stake_input"):
-        return ConversationHandler.END
     draft: Draft = context.user_data.get("draft") or Draft()
+    txt = (update.message.text or "").strip().replace(",", ".")
+    # Aceptar número de stake aunque no se haya pulsado "Cambiar importe"
     try:
-        st = _to_float(update.message.text)
+        st = float(txt)
         if st <= 0:
             raise ValueError()
         draft.stake = st
         draft.betId = gen_bet_id()
+        context.user_data["draft"] = draft
     except Exception:
-        await update.message.reply_text("Stake no válido. Prueba con un número positivo (ej. 1 o 2.5).")
+        # Si no es número, recordamos cómo continuar sin cerrar la conversación
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Usar 1€", callback_data="stake_default"),
+             InlineKeyboardButton("Cambiar importe", callback_data="stake_change")]
+        ])
+        await update.message.reply_text(
+            "Introduce un número para el *stake* (ej. 1 o 2.5), o pulsa un botón:",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return ASK_STAKE
 
-    context.user_data["draft"] = draft
-    context.user_data["awaiting_stake_input"] = False
-
+    # Si llegó aquí, tenemos stake válido -> pedir confirmación
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirmar", callback_data="confirm"),
          InlineKeyboardButton("✖️ Cancelar", callback_data="cancel")]
@@ -472,5 +480,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
