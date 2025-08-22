@@ -361,7 +361,7 @@ async def ask_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["draft"] = draft
 
-    # Teclado de respuestas (no inline) para stake
+    # Teclado de respuestas (NO inline) para stake
     kb = ReplyKeyboardMarkup(
         [["Usar 1€", "Cambiar importe"]],
         resize_keyboard=True,
@@ -495,7 +495,6 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_odds),
             ],
             ASK_STAKE: [
-                CallbackQueryHandler(ask_stake, pattern="^(stake_default|stake_change)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, stake_text),
             ],
             CONFIRM: [
@@ -521,6 +520,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
