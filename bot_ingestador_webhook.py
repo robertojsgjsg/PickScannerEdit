@@ -164,8 +164,8 @@ async def send_to_sheets(draft: Draft) -> dict:
         "result": draft.result,
         "betId": draft.betId,
     }
-    async with httpx.AsyncClient(timeout=12) as client:
-        r = await client.post(SHEETS_WEBAPP_URL, json=payload)
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        r = await client.post(SHEETS_WEBAPP_URL, json=payload, follow_redirects=True)
         r.raise_for_status()
         return r.json()
 
@@ -521,6 +521,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
