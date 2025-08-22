@@ -394,27 +394,51 @@ async def ask_stake(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stake_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft: Draft = context.user_data.get("draft") or Draft()
-    txt = (update.message.text or "").strip().replace(",", ".")
-    # Aceptar número de stake aunque no se haya pulsado "Cambiar importe"
-    try:
-        st = float(txt)
-        if st <= 0:
-            raise ValueError()
-        draft.stake = st
+    txt = (update.message.text or "").strip().lower().replace(",", ".")
+
+    # Botones de ReplyKeyboard escritos como texto (por si llegan)
+    if txt in {"usar 1€", "usar 1", "1€", "default"}:
+        draft.stake = DEFAULT_STAKE
         draft.betId = gen_bet_id()
         context.user_data["draft"] = draft
-    except Exception:
-        # Si no es número, recordamos cómo continuar sin cerrar la conversación
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Usar 1€", callback_data="stake_default"),
-             InlineKeyboardButton("Cambiar importe", callback_data="stake_change")]
-        ])
+    elif txt in {"cambiar importe", "cambiar", "importe"}:
         await update.message.reply_text(
-            "Introduce un número para el *stake* (ej. 1 o 2.5), o pulsa un botón:",
+            "Escribe el *stake* en € (ej. 1 o 2.5):",
             parse_mode="Markdown",
-            reply_markup=kb
+            reply_markup=ReplyKeyboardRemove()
         )
         return ASK_STAKE
+    else:
+        # Número escrito
+        try:
+            st = float(txt)
+            if st <= 0:
+                raise ValueError()
+            draft.stake = st
+            draft.betId = gen_bet_id()
+            context.user_data["draft"] = draft
+        except Exception:
+            # Si no es válido, mostramos de nuevo opciones sin duplicar formato
+            kb = ReplyKeyboardMarkup(
+                [["Usar 1€", "Cambiar importe"]],
+                resize_keyboard=True,
+                one_time_keyboard=True
+            )
+            await update.message.reply_text(
+                "Introduce un número para el *stake* (ej. 1 o 2.5), o usa los botones.",
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+            return ASK_STAKE
+
+    # Confirmación (quitamos cualquier teclado de stake)
+    await update.message.reply_text("Resumen:\n" + summary_text(draft), reply_markup=ReplyKeyboardRemove())
+    kb_confirm = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirmar", callback_data="confirm"),
+         InlineKeyboardButton("✖️ Cancelar", callback_data="cancel")]
+    ])
+    await update.message.reply_text("¿Confirmo envío a Sheets?", reply_markup=kb_confirm)
+    return CONFIRM
 
     # Si llegó aquí, tenemos stake válido -> pedir confirmación
     kb = InlineKeyboardMarkup([
@@ -495,6 +519,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_odds),
             ],
             ASK_STAKE: [
+                CallbackQueryHandler(ask_stake, pattern="^(stake_default|stake_change)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, stake_text),
             ],
             CONFIRM: [
@@ -520,6 +545,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
