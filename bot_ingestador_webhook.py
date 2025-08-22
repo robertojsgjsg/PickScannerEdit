@@ -258,6 +258,11 @@ async def cmd_modificar_celda(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # 👇 Si ya estamos esperando la selección, deriva aquí en vez de reiniciar el flujo
+    if context.user_data.get("awaiting_selection"):
+        return await ask_selection(update, context)
+
     draft = smart_seed(text)
     context.user_data["draft"] = draft
 
@@ -273,6 +278,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=SELEC_KB
     )
+    context.user_data["awaiting_selection"] = True   # 👈 IMPORTANTE
     return ASK_SELECTION
 
 async def ask_teams(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,4 +472,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
