@@ -350,8 +350,9 @@ async def ask_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft: Draft = context.user_data.get("draft") or Draft()
+    # leer la cuota escrita (acepta coma)
     try:
-        draft.odds = _to_float(update.message.text)
+        draft.odds = float((update.message.text or "").strip().replace(",", "."))
         if draft.odds < 1.01:
             raise ValueError()
     except Exception:
@@ -359,14 +360,15 @@ async def ask_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_ODDS
 
     context.user_data["draft"] = draft
-    # (ANTES había InlineKeyboardMarkup; reemplázalo por ReplyKeyboardMarkup)
-kb = ReplyKeyboardMarkup(
-    [["Usar 1€", "Cambiar importe"]],
-    resize_keyboard=True,
-    one_time_keyboard=True
-)
-await update.message.reply_text("¿Stake?", reply_markup=kb)
-return ASK_STAKE
+
+    # Teclado de respuestas (no inline) para stake
+    kb = ReplyKeyboardMarkup(
+        [["Usar 1€", "Cambiar importe"]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await update.message.reply_text("¿Stake?", reply_markup=kb)
+    return ASK_STAKE
 
 async def ask_stake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -519,6 +521,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
