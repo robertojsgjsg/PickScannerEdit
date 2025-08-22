@@ -494,6 +494,33 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelado.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
+async def send_update_result(bet_id: str, result: str) -> dict:
+    payload = {"action": "updateResult", "betId": bet_id, "result": result.upper()}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        r = await client.post(SHEETS_WEBAPP_URL, json=payload, follow_redirects=True)
+        r.raise_for_status()
+        return r.json()
+
+async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Uso: /result <betId> <G|P|N>
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text("Uso: /result <betId> <G|P|N>\nEjemplo: /result TEST123 G")
+        return
+
+    bet_id = context.args[0].strip()
+    res = context.args[1].strip().upper()
+    if res not in {"G", "P", "N"}:
+        await update.message.reply_text("Resultado inválido. Usa G (Ganado), P (Perdido) o N (Nulo).")
+        return
+
+    try:
+        data = await send_update_result(bet_id, res)
+        if not data.get("ok"):
+            raise RuntimeError(data.get("error", "Error en Web App"))
+        await update.message.reply_text(f"✅ Actualizado: betId={bet_id} → Resultado={res} (fila {data.get('row')})")
+    except Exception as e:
+        await update.message.reply_text(f"❌ No pude actualizar: {e}")
+
 # ---------- App boot ----------
 def main():
     if not TOKEN or not SHEETS_WEBAPP_URL or not WEBHOOK_BASE_URL:
@@ -531,7 +558,8 @@ def main():
     )
 
     application.add_handler(conv)
-
+    application.add_handler(CommandHandler("result", cmd_result))
+    
     # Webhook
     url_path = TOKEN  # seguridad básica
     webhook_url = f"{WEBHOOK_BASE_URL}/{url_path}"
@@ -545,6 +573,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
