@@ -258,11 +258,6 @@ async def cmd_modificar_celda(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-
-    # 👇 Si ya estamos esperando la selección, deriva aquí en vez de reiniciar el flujo
-    if context.user_data.get("awaiting_selection"):
-        return await ask_selection(update, context)
-
     draft = smart_seed(text)
     context.user_data["draft"] = draft
 
@@ -278,7 +273,6 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=SELEC_KB
     )
-    context.user_data["awaiting_selection"] = True   # 👈 IMPORTANTE
     return ASK_SELECTION
 
 async def ask_teams(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,16 +293,25 @@ async def ask_teams(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft: Draft = context.user_data.get("draft") or Draft()
     choice = (update.message.text or "").strip().upper()
+
     if choice == "OTRO":
-        await update.message.reply_text("Escribe la selección exacta (texto libre):", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            "Escribe la selección exacta (texto libre):",
+            reply_markup=ReplyKeyboardRemove()
+        )
         return ASK_SELECTION
-    if choice and (choice in ALLOWED_SELECTIONS or draft.selection):
-        draft.selection = choice if choice not in ("OTRO", "") else draft.selection
+
+    if choice and (choice in ALLOWED_SELECTIONS):
+        draft.selection = choice
     else:
-        draft.selection = update.message.text.strip()
+        draft.selection = (update.message.text or "").strip()
 
     context.user_data["draft"] = draft
-    await update.message.reply_text("Escribe la *cuota final* (ej. 1.85 o 1,85):", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        "Escribe la *cuota final* (ej. 1.85 o 1,85):",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
     return ASK_ODDS
 
 async def ask_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -480,6 +483,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
