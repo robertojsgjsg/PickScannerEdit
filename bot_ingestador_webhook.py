@@ -1,632 +1,456 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Bot ingestador (Telegram → Google Sheets via Apps Script) — columna a columna
+
+Flujo por pasos (cada dato se envía en su momento):
+1) Al recibir los EQUIPOS (texto "A vs B"):
+   - alloc (reserva fila) -> set(B, equipos)
+
+2) Al elegir/teclear la SELECCIÓN (1, X, 2, 1X, X2, 12 u "Otro"):
+   - set(C, selección)
+
+3) Al escribir la CUOTA (1.85 o 1,85):
+   - set(D, cuota)
+
+4) Al responder el STAKE (botón "Usar 1€" o importe):
+   - set(E, stake)
+   - set(A, fecha hoy DD/MM/YYYY)
+   - set(F, "Pendiente")
+   - finalize (pone fórmulas G/H en esa fila)
+
+Extras:
+- /apuesta  → lee una celda (J1 por defecto) del Web App ?action=readCell&cell=J1
+- /B<betId> <G|P|N>  → actualiza resultado por betId (col F) usando action=updateResult
+- Dedupe opcional (Upstash REST) en finalize (por fecha|equipos|selección|cuota|stake)
+
+Requisitos entorno (Render → Environment):
+- TELEGRAM_BOT_TOKEN
+- WEBHOOK_BASE_URL           (ej. https://tu-servicio.onrender.com  SIN barra final)
+- SHEETS_WEBAPP_URL          (tu URL /exec del Apps Script)
+- SHEETS_READ_CELL           (opcional, por defecto J1)
+- REDIS_REST_URL             (opcional, para dedupe)
+- REDIS_REST_TOKEN           (opcional, para dedupe)
+- MEMORY_TTL_DAYS=30         (opcional)
+- MEMORY_NAMESPACE=ingestador:v1 (opcional)
+- APUESTA_ALLOWED_USER_ID    (opcional, restringe /apuesta a tu user_id numérico)
+- TZ=Europe/Madrid           (opcional, por si lo usas en logs)
+"""
+
 import os
 import re
 import json
+import hmac
 import hashlib
+import datetime
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import Optional
 
 import httpx
 from telegram import (
-    Update,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, ReplyKeyboardRemove
+    Update, ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, ConversationHandler, filters
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    ContextTypes, filters
 )
 
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # fallback si no hay tzdata
+# ------------------------- Config -------------------------
 
-# ---------- Config ----------
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
-PORT = int(os.getenv("PORT", "8080"))
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+WEBHOOK_BASE_URL = os.environ["WEBHOOK_BASE_URL"].rstrip("/")
+SHEETS_WEBAPP_URL = os.environ["SHEETS_WEBAPP_URL"].strip()
 
-SHEETS_WEBAPP_URL = os.getenv("SHEETS_WEBAPP_URL")
+SHEETS_READ_CELL = os.getenv("SHEETS_READ_CELL", "J1")
+APUESTA_ALLOWED_USER_ID = os.getenv("APUESTA_ALLOWED_USER_ID")  # numérico como str
 
-TZ_NAME = os.getenv("TZ", "Europe/Madrid")
-DEFAULT_STAKE = float(os.getenv("DEFAULT_STAKE", "1"))
-DATE_OUT_FMT = "%d/%m/%Y"  # DD/MM/YYYY
-
-DEDUPE_ENABLED = os.getenv("DEDUPE_ENABLED", "true").lower() == "true"
-REDIS_REST_URL = os.getenv("REDIS_REST_URL", "")
-REDIS_REST_TOKEN = os.getenv("REDIS_REST_TOKEN", "")
+REDIS_REST_URL = os.getenv("REDIS_REST_URL", "").strip()
+REDIS_REST_TOKEN = os.getenv("REDIS_REST_TOKEN", "").strip()
 MEMORY_TTL_DAYS = int(os.getenv("MEMORY_TTL_DAYS", "30"))
 MEMORY_NAMESPACE = os.getenv("MEMORY_NAMESPACE", "ingestador:v1")
 
-APUESTA_DEFAULT_CELL = os.getenv("APUESTA_DEFAULT_CELL", "J1")
-APUESTA_ALLOWED_USER_IDS = {
-    int(x.strip()) for x in os.getenv("APUESTA_ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()
-}
+PORT = int(os.getenv("PORT", "10000"))
 
-ALLOWED_SELECTIONS = ["1", "X", "2", "1X", "X2", "12"]
-SELEC_KB = ReplyKeyboardMarkup(
-    [ALLOWED_SELECTIONS, ["Otro"]],
-    resize_keyboard=True, one_time_keyboard=True
-)
+# ------------------------- Estados -------------------------
 
-# ---------- Conversation states ----------
-ASK_TEAMS, ASK_SELECTION, ASK_ODDS, ASK_STAKE, CONFIRM = range(5)
+ASK_TEAMS, ASK_SELECTION, ASK_SELECTION_FREE, ASK_ODDS, ASK_STAKE = range(5)
+
+SELECTION_CHOICES = [["1", "X", "2"], ["1X", "X2", "12"], ["Otro"]]
+STAKE_CHOICES = [[KeyboardButton("Usar 1€")], [KeyboardButton("Cambiar importe")]]
+
+TEAMS_REGEX = re.compile(r"^(.+?)\s+vs\s+(.+?)$", re.IGNORECASE)
+
+# ------------------------- Modelos -------------------------
 
 @dataclass
 class Draft:
-    date: str = ""       # DD/MM/YYYY
-    teams: str = ""      # "A vs B"
-    selection: str = ""  # final confirmada
-    odds: float = 0.0    # final
-    stake: float = DEFAULT_STAKE
-    result: str = "Pendiente"
-    betId: str = ""      # para col. I
-    raw: str = ""
+    row: int | None = None
+    betId: str | None = None
+    date: str | None = None       # DD/MM/YYYY
+    teams: str | None = None
+    selection: str | None = None
+    odds: float | None = None
+    stake: float | None = None
 
-    def dedupe_key(self) -> str:
-        base = f"{self.date}|{self.teams}|{self.selection}".lower()
-        h = hashlib.sha256(base.encode("utf-8")).hexdigest()
-        return f"{MEMORY_NAMESPACE}:{h}"
+# ------------------------- Helpers HTTP -------------------------
 
-# ---------- Time helpers ----------
-def now_tz():
-    try:
-        if ZoneInfo:
-            return datetime.now(ZoneInfo(TZ_NAME))
-    except Exception:
-        pass
-    return datetime.now()
-
-def today_str() -> str:
-    return now_tz().strftime(DATE_OUT_FMT)
-
-# ---------- Parsing ----------
-def _to_float(num_str: str) -> float:
-    return float(num_str.replace(",", ".").strip())
-
-def _parse_date_ddmmyyyy(text: str) -> Optional[str]:
-    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", text)
-    if not m:
-        return None
-    d, mth, y = m.groups()
-    y = int(y)
-    if y < 100:
-        y += 2000
-    try:
-        dt = datetime(year=y, month=int(mth), day=int(d))
-        return dt.strftime(DATE_OUT_FMT)
-    except ValueError:
-        return None
-
-def _parse_teams(text: str) -> Optional[str]:
-    pat = re.compile(r"([^\n\-–—]+?)\s*(?:vs\.?|v\.?|[-–—])\s*([^\n]+)", re.IGNORECASE)
-    m = pat.search(text)
-    if m:
-        a = re.sub(r"\s+", " ", m.group(1)).strip()
-        b = re.sub(r"\s+", " ", m.group(2)).strip()
-        return f"{a} vs {b}"
-    return None
-
-def smart_seed(text: str) -> Draft:
-    d = Draft(raw=text)
-    d.date = _parse_date_ddmmyyyy(text) or today_str()
-    d.teams = _parse_teams(text) or ""
-    return d  # No autodetectar cuota (siempre preguntar)
-
-# ---------- Upstash (REST) ----------
-async def upstash_cmd(command):
-    if not (REDIS_REST_URL and REDIS_REST_TOKEN):
-        raise RuntimeError("Upstash REST no configurado")
-    async with httpx.AsyncClient(timeout=8) as client:
-        r = await client.post(
-            REDIS_REST_URL,
-            headers={"Authorization": f"Bearer {REDIS_REST_TOKEN}"},
-            json={"command": command},
-        )
-        r.raise_for_status()
-        return r.json()
-
-async def upstash_exists(key: str) -> bool:
-    if not (REDIS_REST_URL and REDIS_REST_TOKEN):
-        return False
-    try:
-        data = await upstash_cmd(["EXISTS", key])
-        return bool(data.get("result") == 1)
-    except Exception:
-        return False
-
-async def upstash_setex(key: str, ttl_days: int, value: str) -> None:
-    if not (REDIS_REST_URL and REDIS_REST_TOKEN):
-        return
-    ttl = max(60, ttl_days * 24 * 3600)
-    await upstash_cmd(["SETEX", key, str(ttl), value])
-
-async def upstash_set(key: str, value: str) -> None:
-    if not (REDIS_REST_URL and REDIS_REST_TOKEN):
-        return
-    await upstash_cmd(["SET", key, value])
-
-async def upstash_get(key: str) -> Optional[str]:
-    if not (REDIS_REST_URL and REDIS_REST_TOKEN):
-        return None
-    data = await upstash_cmd(["GET", key])
-    return data.get("result")
-
-# ---------- Sheets ----------
-async def send_to_sheets(draft: Draft) -> dict:
-    payload = {
-        "date": draft.date,
-        "teams": draft.teams,
-        "selection": draft.selection,
-        "odds": draft.odds,
-        "stake": draft.stake,
-        "result": draft.result,
-        "betId": draft.betId,
-    }
+async def http_post_json(url: str, payload: dict) -> dict:
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        r = await client.post(SHEETS_WEBAPP_URL, json=payload, follow_redirects=True)
+        r = await client.post(url, json=payload)
         r.raise_for_status()
         return r.json()
 
-async def read_cell_from_sheets(cell: str) -> dict:
-    url = f"{SHEETS_WEBAPP_URL}?action=readCell&cell={cell}"
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        r = await client.get(url, follow_redirects=True)
+async def http_get_json(url: str, params: dict | None = None) -> dict:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        r = await client.get(url, params=params)
         r.raise_for_status()
         return r.json()
 
-# ---------- Helpers ----------
-def summary_text(d: Draft) -> str:
-    return (
-        f"📅 Fecha: {d.date}\n"
-        f"🏟️ Partidos: {d.teams or '—'}\n"
-        f"🎯 Selección: {d.selection}\n"
-        f"🧮 Cuota final: {d.odds:.2f}\n"
-        f"💶 Stake: {d.stake:g} €\n"
-        f"🆔 ID: {d.betId or '—'}\n"
-        f"📌 Resultado: {d.result}"
-    )
+# ------------------------- Sheets WebApp (alloc/set/finalize) -------------------------
 
-def gen_bet_id() -> str:
-    ts = int(datetime.now(timezone.utc).timestamp() * 1000)
-    tail = hashlib.sha1(str(ts).encode()).hexdigest()[:4]
-    return f"B{ts}{tail}"
+async def sheets_alloc(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reserva fila: escribe betId en I y devuelve row/betId."""
+    j = await http_post_json(SHEETS_WEBAPP_URL, {"action": "alloc"})
+    context.user_data["row"] = j["row"]
+    context.user_data["betId"] = j["betId"]
 
-def valid_cell_a1(s: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z]+[0-9]+", s))
+async def sheets_set(row: int, col: str, value) -> None:
+    await http_post_json(SHEETS_WEBAPP_URL, {"action": "set", "row": row, "col": col, "value": value})
 
-def is_allowed_user(user_id: int) -> bool:
-    if not APUESTA_ALLOWED_USER_IDS:
-        return True
-    return user_id in APUESTA_ALLOWED_USER_IDS
+async def sheets_finalize(row: int) -> None:
+    await http_post_json(SHEETS_WEBAPP_URL, {"action": "finalize", "row": row})
 
-# ---------- Handlers ----------
+async def sheets_update_result(bet_id: str, result: str) -> dict:
+    return await http_post_json(SHEETS_WEBAPP_URL, {"action": "updateResult", "betId": bet_id, "result": result})
+
+async def sheets_read_cell(a1: str) -> str:
+    j = await http_get_json(SHEETS_WEBAPP_URL, {"action": "readCell", "cell": a1})
+    return str(j.get("value", ""))
+
+def today_ddmmyyyy() -> str:
+    return datetime.datetime.now().strftime("%d/%m/%Y")
+
+# ------------------------- Upstash dedupe (opcional) -------------------------
+
+def _dedupe_key(fingerprint: str) -> str:
+    return f"{MEMORY_NAMESPACE}:{fingerprint}"
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+async def dedupe_exists(fingerprint: str) -> bool:
+    if not REDIS_REST_URL or not REDIS_REST_TOKEN:  # dedupe desactivado si faltan
+        return False
+    url = f"{REDIS_REST_URL}/get/{_dedupe_key(fingerprint)}"
+    headers = {"Authorization": f"Bearer {REDIS_REST_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        data = r.json()
+        return data.get("result") is not None
+
+async def dedupe_set(fingerprint: str, ttl_days: int = MEMORY_TTL_DAYS) -> None:
+    if not REDIS_REST_URL or not REDIS_REST_TOKEN:
+        return
+    seconds = ttl_days * 24 * 3600
+    url = f"{REDIS_REST_URL}/setex/{_dedupe_key(fingerprint)}/{seconds}/{fingerprint}"
+    headers = {"Authorization": f"Bearer {REDIS_REST_TOKEN}"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+
+# ------------------------- Conversación -------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id if update.effective_user else None
-    msg = (
-        "Soy tu bot *ingestador*.\n"
-        "Pégame el pronóstico y te pediré datos para guardarlo en Google Sheets.\n\n"
-        f"Tu *user_id* es: `{uid}` (por si quieres limitar /apuesta).\n"
-        f"Celda por defecto para /apuesta: `{APUESTA_DEFAULT_CELL}`.\n"
-        "Cambia con /modificarcelda A1 (p. ej. /modificarcelda J1)."
+    await update.message.reply_text(
+        "Soy tu bot ingestador.\n"
+        "Pégame los equipos como: «Equipo A vs Equipo B».\n"
+        "Después te pediré selección, cuota y stake.\n\n"
+        "Comandos: /apuesta, /cancel\n"
+        "Actualizar resultado rápido:  /B<betId> G|P|N  (ej. /BABC123 P)"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    return ASK_TEAMS
+
+def _is_allowed_for_apuesta(user_id: int) -> bool:
+    if not APUESTA_ALLOWED_USER_ID:
+        return True
+    try:
+        return int(APUESTA_ALLOWED_USER_ID) == user_id
+    except Exception:
+        return True
 
 async def cmd_apuesta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id if update.effective_user else None
-    if not is_allowed_user(uid):
-        await update.message.reply_text("No autorizado para /apuesta.")
-        return
-
-    cell_key = f"{MEMORY_NAMESPACE}:apuesta_cell:{uid}"
-    cell = APUESTA_DEFAULT_CELL
+    if not _is_allowed_for_apuesta(update.effective_user.id):
+        return await update.message.reply_text("No tienes permiso para /apuesta.")
     try:
-        v = await upstash_get(cell_key)
-        if v:
-            cell = v
-    except Exception:
-        pass
-
-    try:
-        data = await read_cell_from_sheets(cell)
-        if not data.get("ok"):
-            raise RuntimeError(data.get("error", "Error leyendo celda"))
-        value = data.get("value", "")
-        await update.message.reply_text(f"📈 Apuesta sugerida ({cell}): {value}")
+        cell = SHEETS_READ_CELL
+        val = await sheets_read_cell(cell)
+        txt = f"📈 Apuesta sugerida ({cell}): {val}".strip()
+        await update.message.reply_text(txt)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error leyendo {cell}: {e}")
+        await update.message.reply_text(f"❌ Error leyendo {SHEETS_READ_CELL}: {e}")
 
-async def cmd_modificar_celda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id if update.effective_user else None
-    if not is_allowed_user(uid):
-        await update.message.reply_text("No autorizado para /modificarcelda.")
-        return
-    if not context.args:
-        await update.message.reply_text("Uso: /modificarcelda J1")
-        return
-    cell = context.args[0].upper()
-    if not valid_cell_a1(cell):
-        await update.message.reply_text("Celda inválida. Ej: J1, H2, AA10…")
-        return
-    key = f"{MEMORY_NAMESPACE}:apuesta_cell:{uid}"
-    try:
-        await upstash_set(key, cell)
-        await update.message.reply_text(f"✅ Celda para /apuesta actualizada a {cell}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ No pude guardar la celda: {e}")
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Cancelado. Cuando quieras, envía «Equipo A vs Equipo B».")
+    return ConversationHandler.END
 
-async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    draft: Optional[Draft] = context.user_data.get("draft")
-
-    # Si ya hay un borrador, enruta según lo que falte
-    if isinstance(draft, Draft):
-        # 1) Si aún no hay equipos, intenta tomarlos de este mensaje
-        if not draft.teams:
-            if " vs " in txt or " VS " in txt.upper():
-                draft.teams = txt
-                context.user_data["draft"] = draft
-                await update.message.reply_text(
-                    "Selecciona la *apuesta real* que jugaste:",
-                    parse_mode="Markdown",
-                    reply_markup=SELEC_KB
-                )
-                return ASK_SELECTION
-            else:
-                await update.message.reply_text(
-                    "No pude reconocer los *equipos*.\nEscríbelos como `Equipo A vs Equipo B`:",
-                    parse_mode="Markdown",
-                )
-                return ASK_TEAMS
-
-        # 2) Si faltaba selección, trata este texto como selección (incluye “Otro” y libre)
-        if not draft.selection:
-            return await ask_selection(update, context)
-
-        # 3) Si falta la cuota, trata este texto como cuota
-        if not draft.odds or draft.odds < 1.01:
-            return await ask_odds(update, context)
-
-        # 4) Si ya hay cuota, trata este texto como stake (número o botones)
-        return await stake_text(update, context)
-
-    # Si NO hay borrador aún: sembrar desde el mensaje pegado
-    draft = smart_seed(txt)
-    context.user_data["draft"] = draft
-
-    if not draft.teams:
-        await update.message.reply_text(
-            "No pude reconocer los *equipos*.\nEscríbelos como `Equipo A vs Equipo B`:",
-            parse_mode="Markdown",
-        )
+async def handle_teams(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    m = TEAMS_REGEX.match(text)
+    if not m:
+        await update.message.reply_text("Formato no válido. Escribe: «Equipo A vs Equipo B».")
         return ASK_TEAMS
 
-    await update.message.reply_text(
-        "Selecciona la *apuesta real* que jugaste:",
-        parse_mode="Markdown",
-        reply_markup=SELEC_KB
-    )
-    return ASK_SELECTION
-
-async def ask_teams(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teams = f"{m.group(1).strip()} vs {m.group(2).strip()}"
     draft: Draft = context.user_data.get("draft") or Draft()
-    val = update.message.text.strip()
-    if " vs " not in val and " VS " not in val.upper():
-        await update.message.reply_text("Formato esperado: `Equipo A vs Equipo B`", parse_mode="Markdown")
-        return ASK_TEAMS
-    draft.teams = val
+    draft.teams = teams
+
+    # Reserva fila en cuanto tenemos el primer dato y lo escribimos (col B)
+    if "row" not in context.user_data:
+        await sheets_alloc(context)
+    row = context.user_data["row"]
     context.user_data["draft"] = draft
-    await update.message.reply_text(
-        "Selecciona la *apuesta real* que jugaste:",
-        parse_mode="Markdown",
-        reply_markup=SELEC_KB
-    )
+
+    try:
+        await sheets_set(row, "B", draft.teams)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ No pude escribir equipos en la hoja: {e}")
+
+    # Preguntar selección
+    kb = ReplyKeyboardMarkup(SELECTION_CHOICES, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("Selecciona la apuesta real que jugaste:", reply_markup=kb)
     return ASK_SELECTION
 
-async def ask_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    draft: Draft = context.user_data.get("draft") or Draft()
+async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = (update.message.text or "").strip().upper()
-
     if choice == "OTRO":
-        await update.message.reply_text(
-            "Escribe la selección exacta (texto libre):",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        await update.message.reply_text("Escribe la selección exacta (texto libre):")
+        return ASK_SELECTION_FREE
+
+    if choice not in {"1", "X", "2", "1X", "X2", "12"}:
+        kb = ReplyKeyboardMarkup(SELECTION_CHOICES, resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("Opción no válida. Elige de teclado o «Otro».", reply_markup=kb)
         return ASK_SELECTION
 
-    if choice and (choice in ALLOWED_SELECTIONS):
-        draft.selection = choice
-    else:
-        draft.selection = (update.message.text or "").strip()
-
+    draft: Draft = context.user_data.get("draft") or Draft()
+    draft.selection = choice
     context.user_data["draft"] = draft
-    await update.message.reply_text(
-        "Escribe la *cuota final* (ej. 1.85 o 1,85):",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
-    )
+
+    # set C
+    try:
+        row = context.user_data["row"]
+        await sheets_set(row, "C", draft.selection)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ No pude escribir la selección: {e}")
+
+    await update.message.reply_text("Escribe la cuota final (ej. 1.85 o 1,85):")
     return ASK_ODDS
 
-async def ask_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_selection_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sel = (update.message.text or "").strip()
+    if not sel:
+        await update.message.reply_text("Escribe la selección exacta (texto libre):")
+        return ASK_SELECTION_FREE
+
     draft: Draft = context.user_data.get("draft") or Draft()
-    # leer la cuota escrita (acepta coma)
+    draft.selection = sel
+    context.user_data["draft"] = draft
+
+    # set C
     try:
-        draft.odds = float((update.message.text or "").strip().replace(",", "."))
-        if draft.odds < 1.01:
+        row = context.user_data["row"]
+        await sheets_set(row, "C", draft.selection)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ No pude escribir la selección: {e}")
+
+    await update.message.reply_text("Escribe la cuota final (ej. 1.85 o 1,85):")
+    return ASK_ODDS
+
+async def handle_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip().replace(",", ".")
+    try:
+        odds = float(raw)
+        if odds < 1.01:
             raise ValueError()
     except Exception:
         await update.message.reply_text("Formato de cuota no válido. Prueba con 1.85 o 1,85.")
         return ASK_ODDS
 
+    draft: Draft = context.user_data.get("draft") or Draft()
+    draft.odds = odds
     context.user_data["draft"] = draft
 
-    # Teclado de respuestas (NO inline) para stake
-    kb = ReplyKeyboardMarkup(
-        [["Usar 1€", "Cambiar importe"]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+    # set D
+    try:
+        row = context.user_data["row"]
+        await sheets_set(row, "D", draft.odds)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ No pude escribir la cuota: {e}")
+
+    kb = ReplyKeyboardMarkup(STAKE_CHOICES, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("¿Stake?", reply_markup=kb)
     return ASK_STAKE
 
-async def ask_stake(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    draft: Draft = context.user_data.get("draft") or Draft()
-
-    if query.data == "stake_default":
-        draft.stake = DEFAULT_STAKE
-        draft.betId = gen_bet_id()
-        context.user_data["draft"] = draft
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirmar", callback_data="confirm"),
-             InlineKeyboardButton("✖️ Cancelar", callback_data="cancel")]
-        ])
-        await query.edit_message_text("Resumen:\n" + summary_text(draft))
-        await query.message.reply_text("¿Confirmo envío a Sheets?", reply_markup=kb)
-        return CONFIRM
-
-    elif query.data == "stake_change":
-        context.user_data["awaiting_stake_input"] = True
-        await query.edit_message_text("Escribe el *stake* en € (ej. 1 o 2.5):", parse_mode="Markdown")
-        return ASK_STAKE
-
-async def stake_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    draft: Draft = context.user_data.get("draft") or Draft()
-    txt = (update.message.text or "").strip().lower().replace(",", ".")
-
-    # Botones de ReplyKeyboard escritos como texto (por si llegan)
-    if txt in {"usar 1€", "usar 1", "1€", "default"}:
-        draft.stake = DEFAULT_STAKE
-        draft.betId = gen_bet_id()
-        context.user_data["draft"] = draft
-    elif txt in {"cambiar importe", "cambiar", "importe"}:
-        await update.message.reply_text(
-            "Escribe el *stake* en € (ej. 1 o 2.5):",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
+async def handle_stake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.lower().startswith("usar 1"):
+        stake = 1.0
+    elif text.lower().startswith("cambiar"):
+        await update.message.reply_text("Escribe el importe (ej. 1.00):")
         return ASK_STAKE
     else:
-        # Número escrito
+        # Intentar parsear número
+        raw = text.replace(",", ".")
         try:
-            st = float(txt)
-            if st <= 0:
+            stake = float(raw)
+            if stake <= 0:
                 raise ValueError()
-            draft.stake = st
-            draft.betId = gen_bet_id()
-            context.user_data["draft"] = draft
         except Exception:
-            # Si no es válido, mostramos de nuevo opciones sin duplicar formato
-            kb = ReplyKeyboardMarkup(
-                [["Usar 1€", "Cambiar importe"]],
-                resize_keyboard=True,
-                one_time_keyboard=True
-            )
-            await update.message.reply_text(
-                "Introduce un número para el *stake* (ej. 1 o 2.5), o usa los botones.",
-                parse_mode="Markdown",
-                reply_markup=kb
-            )
+            await update.message.reply_text("Formato no válido. Escribe un número (ej. 1.00).")
             return ASK_STAKE
 
-    # Confirmación (quitamos cualquier teclado de stake)
-    await update.message.reply_text("Resumen:\n" + summary_text(draft), reply_markup=ReplyKeyboardRemove())
-    kb_confirm = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirmar", callback_data="confirm"),
-         InlineKeyboardButton("✖️ Cancelar", callback_data="cancel")]
-    ])
-    await update.message.reply_text("¿Confirmo envío a Sheets?", reply_markup=kb_confirm)
-    return CONFIRM
-
-    # Si llegó aquí, tenemos stake válido -> pedir confirmación
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirmar", callback_data="confirm"),
-         InlineKeyboardButton("✖️ Cancelar", callback_data="cancel")]
-    ])
-    await update.message.reply_text("Resumen:\n" + summary_text(draft))
-    await update.message.reply_text("¿Confirmo envío a Sheets?", reply_markup=kb)
-    return CONFIRM
-
-async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
     draft: Draft = context.user_data.get("draft") or Draft()
+    draft.stake = stake
+    if not draft.date:
+        draft.date = today_ddmmyyyy()
+    context.user_data["draft"] = draft
 
-    if query.data == "cancel":
-        await query.edit_message_text("Cancelado. No se envió nada.")
-        context.user_data.clear()
-        return ConversationHandler.END
+    row = context.user_data["row"]
+    betId = context.user_data.get("betId")
 
-    if query.data == "confirm":
-        # Dedup (opcional)
-        if DEDUPE_ENABLED:
-            key = draft.dedupe_key()
-            try:
-                if await upstash_exists(key):
-                    await query.edit_message_text("⚠️ Posible duplicado. No envié la fila.")
-                    context.user_data.clear()
-                    return ConversationHandler.END
-            except Exception:
-                pass
+    # --- Escribir E, A, F y finalizar (G/H) ---
+    errors = []
 
-        # Enviar a Sheets
-        try:
-            res = await send_to_sheets(draft)
-            if not res.get("ok"):
-                raise RuntimeError(res.get("error", "Sheets WebApp error"))
-            # Marcar dedupe + snapshot
-            if DEDUPE_ENABLED:
-                try:
-                    await upstash_setex(draft.dedupe_key(), MEMORY_TTL_DAYS, json.dumps(asdict(draft)))
-                except Exception:
-                    pass
-            await query.edit_message_text("✅ Enviado a Google Sheets:\n" + summary_text(draft))
-        except Exception as e:
-            await query.edit_message_text(f"❌ Error enviando a Sheets: {e}")
-        finally:
-            context.user_data.clear()
-        return ConversationHandler.END
+    try:
+        await sheets_set(row, "E", draft.stake)
+    except Exception as e:
+        errors.append(f"E(stake): {e}")
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await sheets_set(row, "A", draft.date)
+    except Exception as e:
+        errors.append(f"A(fecha): {e}")
+
+    try:
+        await sheets_set(row, "F", "Pendiente")
+    except Exception as e:
+        errors.append(f"F(resultado): {e}")
+
+    # DEDUPE (opcional) — lo hacemos al final, con todos los datos ya rellenados
+    try:
+        fp_raw = f"{draft.date}|{draft.teams}|{draft.selection}|{draft.odds}|{draft.stake}"
+        fp = _sha256_hex(fp_raw)
+        if await dedupe_exists(fp):
+            await update.message.reply_text("⚠️ Duplicado detectado (no detengo la escritura, sólo aviso).")
+        else:
+            await dedupe_set(fp)
+    except Exception:
+        pass
+
+    try:
+        await sheets_finalize(row)
+    except Exception as e:
+        errors.append(f"finalize(G/H): {e}")
+
+    # Resumen
+    summary = (
+        "✅ Enviado a Google Sheets:\n"
+        f"📅 Fecha: {draft.date}\n"
+        f"🏟️ Partidos: {draft.teams}\n"
+        f"🎯 Selección: {draft.selection}\n"
+        f"🧮 Cuota final: {draft.odds}\n"
+        f"💶 Stake: {draft.stake} €\n"
+        f"🆔 ID: {betId}\n"
+        f"📌 Resultado: Pendiente"
+    )
+    if errors:
+        summary += "\n\n⚠️ Incidencias:\n- " + "\n- ".join(errors)
+
+    await update.message.reply_text(summary)
+
+    # Limpiar estado
     context.user_data.clear()
-    await update.message.reply_text("Cancelado.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-async def send_update_result(bet_id: str, result: str) -> dict:
-    payload = {"action": "updateResult", "betId": bet_id, "result": result.upper()}
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        r = await client.post(SHEETS_WEBAPP_URL, json=payload, follow_redirects=True)
-        r.raise_for_status()
-        return r.json()
+# ------------------------- Comando /B<betId> G|P|N -------------------------
 
-async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Uso: /result <betId> <G|P|N>
-    if not context.args or len(context.args) != 2:
-        await update.message.reply_text("Uso: /result <betId> <G|P|N>\nEjemplo: /result TEST123 G")
-        return
+RESULT_CMD_RE = re.compile(r"^/B([A-Za-z0-9\-\_]+)\s+([GgPpNn])$")
 
-    bet_id = context.args[0].strip()
-    res = context.args[1].strip().upper()
-    if res not in {"G", "P", "N"}:
-        await update.message.reply_text("Resultado inválido. Usa G (Ganado), P (Perdido) o N (Nulo).")
-        return
+async def handle_quick_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    m = RESULT_CMD_RE.match(text)
+    if not m:
+        return  # dejar que otros handlers sigan
 
+    bet_id = m.group(1)
+    result = m.group(2).upper()
     try:
-        data = await send_update_result(bet_id, res)
-        if not data.get("ok"):
-            raise RuntimeError(data.get("error", "Error en Web App"))
-        await update.message.reply_text(f"✅ Actualizado: betId={bet_id} → Resultado={res} (fila {data.get('row')})")
+        j = await sheets_update_result(bet_id, result)
+        if j.get("ok"):
+            row = j.get("row")
+            await update.message.reply_text(
+                f"✅ Actualizado: betId={bet_id} → Resultado={result} (fila {row})"
+            )
+        else:
+            await update.message.reply_text(f"❌ No pude actualizar: {j}")
     except Exception as e:
-        await update.message.reply_text(f"❌ No pude actualizar: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
-async def cmd_result_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Permite: /<betId> <G|P|N>
-    Ej: /B17559000842117a4e G
-    """
-    if not update.message or not update.message.text:
-        return
+# ------------------------- Fallback texto fuera de conversación -------------------------
 
-    txt = update.message.text.strip()
-    parts = txt.split()
-    if not parts:
-        return
+async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Si no estamos en conversación, intenta iniciar con equipos
+    if update.message and update.message.text and TEAMS_REGEX.match(update.message.text.strip()):
+        # Simular entrada al flujo
+        return await handle_teams(update, context)
+    else:
+        await update.message.reply_text("Envía «Equipo A vs Equipo B» para empezar, o /start.")
+        return ConversationHandler.END
 
-    cmd = parts[0]
-    if not cmd.startswith("/"):
-        return
-    if "@" in cmd:
-        cmd = cmd.split("@", 1)[0]
-    bet_id = cmd[1:]  # sin la barra inicial
+# ------------------------- Main / Webhook -------------------------
 
-    known = {"start", "apuesta", "modificarcelda", "result", "cancel", "help"}
-    if bet_id.lower() in known:
-        return
-
-    if not re.fullmatch(r"[A-Za-z0-9_]{6,64}", bet_id):
-        return
-
-    res = parts[1].strip().upper() if len(parts) >= 2 else ""
-    if res not in {"G", "P", "N"}:
-        await update.message.reply_text("Uso: /<betId> <G|P|N>\nEj: /B17559000842117a4e G")
-        return
-
-    try:
-        data = await send_update_result(bet_id, res)
-        if not data.get("ok"):
-            raise RuntimeError(data.get("error", "Error en Web App"))
-        await update.message.reply_text(
-            f"✅ Actualizado: betId={bet_id} → Resultado={res} (fila {data.get('row')})"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ No pude actualizar: {e}")
-
-# ---------- App boot ----------
 def main():
-    if not TOKEN or not SHEETS_WEBAPP_URL or not WEBHOOK_BASE_URL:
-        raise SystemExit("Faltan variables: TELEGRAM_BOT_TOKEN, SHEETS_WEBAPP_URL, WEBHOOK_BASE_URL")
-
     application = Application.builder().token(TOKEN).build()
 
+    # Conversación principal
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            CommandHandler("apuesta", cmd_apuesta),
-            CommandHandler("modificarcelda", cmd_modificar_celda),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text),
+            # Si el usuario pega directamente equipos, también inicia:
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_teams),
         ],
         states={
-            ASK_TEAMS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_teams),
-            ],
-            ASK_SELECTION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_selection),
-            ],
-            ASK_ODDS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_odds),
-            ],
-            ASK_STAKE: [
-                CallbackQueryHandler(ask_stake, pattern="^(stake_default|stake_change)$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, stake_text),
-            ],
-            CONFIRM: [
-                CallbackQueryHandler(confirm, pattern="^(confirm|cancel)$"),
-            ],
+            ASK_TEAMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_teams)],
+            ASK_SELECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_selection)],
+            ASK_SELECTION_FREE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_selection_free)],
+            ASK_ODDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_odds)],
+            ASK_STAKE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_stake)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
         allow_reentry=True,
+        per_chat=True,
+        per_user=True,
     )
 
+    # Handlers adicionales
     application.add_handler(conv)
-    application.add_handler(CommandHandler("result", cmd_result))
-    application.add_handler(MessageHandler(filters.COMMAND, cmd_result_alias))
+    application.add_handler(CommandHandler("apuesta", cmd_apuesta))
+    application.add_handler(CommandHandler("cancel", cmd_cancel))
+    # /B<betId> G|P|N (regex handler como "message" para capturarlo siempre)
+    application.add_handler(MessageHandler(filters.Regex(RESULT_CMD_RE), handle_quick_result))
+    # Fallback para otros textos fuera de conv:
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
-    # Webhook
-    url_path = TOKEN  # seguridad básica
-    webhook_url = f"{WEBHOOK_BASE_URL}/{url_path}"
-
+    # Webhook PTB 21
+    webhook_url = f"{WEBHOOK_BASE_URL}/{TOKEN}"
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=url_path,
+        url_path=TOKEN,
         webhook_url=webhook_url,
     )
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
